@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 
 // ---- Point this at your FastAPI backend ----
-const API_URL = "http://localhost:8000";
+const API_URL = "https://nl-openscenario-frontend.vercel.app/";
 // --------------------------------------------
 
 const EXAMPLES = [
