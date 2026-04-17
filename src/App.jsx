@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 
 // ---- Point this at your FastAPI backend ----
-const API_URL = "https://nl-openscenario-api.onrender.com";
+const API_URL = "http://localhost:8000";
 // --------------------------------------------
 
 const EXAMPLES = [
@@ -11,6 +11,16 @@ const EXAMPLES = [
   "Emergency ambulance approaching from behind on a wet highway",
   "A cyclist overtakes on a narrow street while a delivery truck is stopped",
   "Two vehicles approach a blind intersection at the same time in fog",
+];
+
+const LOADING_PHASES = [
+  { after: 0, msg: "Sending request to backend...", sub: "" },
+  { after: 3, msg: "Calling the LLM inference endpoint...", sub: "" },
+  { after: 8, msg: "Model is waking up...", sub: "The GPU endpoint scales to zero when idle. First request takes 1-3 minutes." },
+  { after: 20, msg: "Still warming up the model...", sub: "Loading Llama 3.2 3B weights onto the GPU. This only happens on the first request." },
+  { after: 45, msg: "Almost there...", sub: "vLLM is compiling CUDA graphs. Subsequent requests will be fast." },
+  { after: 90, msg: "Hang tight, model is still initializing...", sub: "Cold starts can take up to 3 minutes. This is a one-time wait." },
+  { after: 150, msg: "This is taking longer than usual...", sub: "The endpoint may be experiencing high load. Feel free to wait or retry." },
 ];
 
 function StatusPill({ label, value }) {
@@ -25,13 +35,97 @@ function StatusPill({ label, value }) {
   );
 }
 
+function LoadingState({ elapsed }) {
+  // Find the current phase based on elapsed seconds
+  let phase = LOADING_PHASES[0];
+  for (let i = LOADING_PHASES.length - 1; i >= 0; i--) {
+    if (elapsed >= LOADING_PHASES[i].after) {
+      phase = LOADING_PHASES[i];
+      break;
+    }
+  }
+
+  const isColdStart = elapsed >= 8;
+  const progress = Math.min(95, (elapsed / 180) * 100);
+
+  return (
+    <div style={{
+      marginTop: 24, padding: "28px 24px", textAlign: "center",
+      background: "#0c0c14", border: "1px solid #161624", borderRadius: 10,
+    }}>
+      {/* Spinner */}
+      <div style={{
+        width: 28, height: 28,
+        border: "2.5px solid #1c1c2c",
+        borderTopColor: "#e85d04",
+        borderRadius: "50%",
+        margin: "0 auto 18px",
+        animation: "spin 0.7s linear infinite",
+      }} />
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+
+      {/* Main message */}
+      <p style={{
+        margin: 0, fontSize: 13, color: "#bbb", fontWeight: 500,
+        fontFamily: "'DM Sans', sans-serif",
+      }}>{phase.msg}</p>
+
+      {/* Sub message */}
+      {phase.sub && (
+        <p style={{
+          margin: "6px auto 0", fontSize: 11, color: "#555",
+          maxWidth: 420, lineHeight: 1.5,
+        }}>{phase.sub}</p>
+      )}
+
+      {/* Progress bar (shows after cold start detected) */}
+      {isColdStart && (
+        <div style={{
+          marginTop: 16, maxWidth: 300, marginLeft: "auto", marginRight: "auto",
+        }}>
+          <div style={{
+            height: 3, background: "#161624", borderRadius: 2, overflow: "hidden",
+          }}>
+            <div style={{
+              height: "100%",
+              width: `${progress}%`,
+              background: "linear-gradient(90deg, #e85d04, #dc2626)",
+              borderRadius: 2,
+              transition: "width 1s linear",
+            }} />
+          </div>
+          <p style={{
+            margin: "6px 0 0", fontSize: 10, color: "#333",
+            fontFamily: "'IBM Plex Mono', monospace",
+          }}>{Math.floor(elapsed)}s elapsed</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [prompt, setPrompt] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState(null);
   const [tab, setTab] = useState("json");
   const [copied, setCopied] = useState("");
+  const timerRef = useRef(null);
+
+  // Elapsed time counter during loading
+  useEffect(() => {
+    if (loading) {
+      setElapsed(0);
+      timerRef.current = setInterval(() => {
+        setElapsed(prev => prev + 1);
+      }, 1000);
+    } else {
+      clearInterval(timerRef.current);
+    }
+    return () => clearInterval(timerRef.current);
+  }, [loading]);
 
   const generate = async () => {
     if (!prompt.trim() || loading) return;
@@ -39,24 +133,55 @@ export default function App() {
     setError(null);
     setResult(null);
 
-    try {
-      const res = await fetch(`${API_URL}/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || `Server error ${res.status}`);
+    const MAX_RETRIES = 2;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(`${API_URL}/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt }),
+        });
+
+        if (res.status === 503) {
+          // HF endpoint is cold-starting, wait and retry
+          if (attempt < MAX_RETRIES) {
+            await new Promise(r => setTimeout(r, 15000)); // wait 15s
+            continue;
+          }
+        }
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }));
+          const detail = err.detail || `Server error ${res.status}`;
+
+          // Friendly message for cold start errors
+          if (detail.includes("503") || detail.includes("Service Unavailable")) {
+            throw new Error(
+              "The AI model is still waking up. Please wait 1-2 minutes and try again. " +
+              "The GPU scales to zero when idle to save costs."
+            );
+          }
+          throw new Error(detail);
+        }
+
+        const data = await res.json();
+        setResult(data);
+        setTab("json");
+        setLoading(false);
+        return; // Success, exit
+      } catch (e) {
+        lastError = e;
+        if (attempt < MAX_RETRIES && (e.message.includes("503") || e.message.includes("fetch"))) {
+          await new Promise(r => setTimeout(r, 10000));
+          continue;
+        }
       }
-      const data = await res.json();
-      setResult(data);
-      setTab("json");
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setLoading(false);
     }
+
+    setError(lastError?.message || "Unknown error");
+    setLoading(false);
   };
 
   const download = (content, filename, mime = "application/json") => {
@@ -168,29 +293,26 @@ export default function App() {
         {!loading && <span style={{ fontSize: 10, color: "#333", marginLeft: 10 }}>Ctrl+Enter</span>}
 
         {/* LOADING */}
-        {loading && (
-          <div style={{
-            marginTop: 24, padding: 36, textAlign: "center",
-            background: "#0c0c14", border: "1px solid #161624", borderRadius: 10,
-          }}>
-            <div style={{
-              width: 24, height: 24, border: "2px solid #1c1c2c",
-              borderTopColor: "#e85d04", borderRadius: "50%",
-              margin: "0 auto 14px", animation: "spin 0.7s linear infinite",
-            }} />
-            <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
-            <p style={{ margin: 0, fontSize: 12, color: "#555" }}>Calling LLM and converting to XOSC...</p>
-            <p style={{ margin: "4px 0 0", fontSize: 10, color: "#333" }}>May take a moment on cold start</p>
-          </div>
-        )}
+        {loading && <LoadingState elapsed={elapsed} />}
 
         {/* ERROR */}
         {error && (
           <div style={{
-            marginTop: 20, padding: "12px 16px", fontSize: 12, lineHeight: 1.6,
+            marginTop: 20, padding: "14px 18px", fontSize: 12, lineHeight: 1.7,
             background: "#140a0a", border: "1px solid #2e1212", borderRadius: 8, color: "#f87171",
           }}>
             {error}
+            {error.includes("waking up") && (
+              <div style={{ marginTop: 10 }}>
+                <button onClick={generate} style={{
+                  padding: "7px 16px", fontSize: 11, fontWeight: 500,
+                  background: "#e85d04", border: "none", borderRadius: 5,
+                  color: "#fff", cursor: "pointer", fontFamily: "'DM Sans', sans-serif",
+                }}>
+                  Retry Now
+                </button>
+              </div>
+            )}
           </div>
         )}
 
