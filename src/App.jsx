@@ -1,7 +1,7 @@
 import { useState } from "react";
 
 // ---- Point this at your FastAPI backend ----
-const API_URL = "https://nl-openscenario-api.onrender.com/";
+const API_URL = "https://nl-openscenario-api.onrender.com";
 // --------------------------------------------
 
 const EXAMPLES = [
