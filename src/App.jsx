@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 
 // ---- Point this at your FastAPI backend ----
-const API_URL = "https://nl-openscenario-api.onrender.com";
+const API_URL = "http://localhost:8000";
 // --------------------------------------------
 
 const EXAMPLES = [
@@ -144,25 +144,23 @@ export default function App() {
           body: JSON.stringify({ prompt }),
         });
 
-        if (res.status === 503) {
-          // HF endpoint is cold-starting, wait and retry
-          if (attempt < MAX_RETRIES) {
-            await new Promise(r => setTimeout(r, 15000)); // wait 15s
-            continue;
-          }
+        // Only retry on 502/503 (cold start / unavailable)
+        if ((res.status === 502 || res.status === 503) && attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, 15000));
+          continue;
         }
 
         if (!res.ok) {
           const err = await res.json().catch(() => ({ detail: res.statusText }));
           const detail = err.detail || `Server error ${res.status}`;
 
-          // Friendly message for cold start errors
-          if (detail.includes("503") || detail.includes("Service Unavailable")) {
+          if (res.status === 502 || res.status === 503 || detail.includes("Service Unavailable")) {
             throw new Error(
               "The AI model is still waking up. Please wait 1-2 minutes and try again. " +
               "The GPU scales to zero when idle to save costs."
             );
           }
+          // All other errors (400, 404, 422, 500) - don't retry, show immediately
           throw new Error(detail);
         }
 
@@ -170,10 +168,12 @@ export default function App() {
         setResult(data);
         setTab("json");
         setLoading(false);
-        return; // Success, exit
+        return;
       } catch (e) {
         lastError = e;
-        if (attempt < MAX_RETRIES && (e.message.includes("503") || e.message.includes("fetch"))) {
+        // Only retry on network failures or cold-start errors
+        const isRetryable = e.message === "Failed to fetch" || e.message.includes("waking up");
+        if (attempt < MAX_RETRIES && isRetryable) {
           await new Promise(r => setTimeout(r, 10000));
           continue;
         }
